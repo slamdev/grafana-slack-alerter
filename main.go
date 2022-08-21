@@ -19,6 +19,7 @@ var webhookUrl string
 
 func main() {
 	flag.StringVar(&webhookUrl, "webhook-url", "", "Slack webhook url")
+	flag.Parse()
 
 	http.HandleFunc("/slack", handleWebhookRequest)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -106,10 +107,11 @@ func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
 			labelBlocks = append(labelBlocks, slack.NewSectionBlock(nil, fields, nil))
 		}
 
-		contextElements := []slack.MixedElement{
-			slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false),
-			slack.NewTextBlockObject("plain_text", fmt.Sprintf("Started at: %s", alert.StartsAt.Format(time.RFC822)), true, false),
+		var contextElements []slack.MixedElement
+		if alert.ValueString != "" {
+			contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false))
 		}
+		contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Started at: %s", alert.StartsAt.Format(time.RFC822)), true, false))
 		if !alert.EndsAt.IsZero() {
 			contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Ended at: %s", alert.EndsAt.Format(time.RFC822)), true, false))
 		}
@@ -134,7 +136,15 @@ func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
 func extractValue(valueString string) string {
 	// [ var='B' labels={job_name=XXX, namespace=yyy} value=123456 ]
 	parts := strings.Split(valueString, "value=")
+	if len(parts) != 2 {
+		log.Printf("cannot split value by 'value=': %s", valueString)
+		return valueString
+	}
 	value := strings.Split(parts[1], " ")
+	if len(value) == 0 {
+		log.Printf("cannot split value by ' ': %s", valueString)
+		return valueString
+	}
 	return value[0]
 }
 

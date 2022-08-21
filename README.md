@@ -24,8 +24,10 @@ spec:
       containers:
         - name: grafana-slack-alerter
           image: slamdev/grafana-slack-alerter
+          args: [ '--webhook-url=https://hooks.slack.com/services/T0XXX' ]
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
 ---
 apiVersion: v1
 kind: Service
