@@ -9,8 +9,10 @@ import (
 	"golang.org/x/exp/maps"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -62,7 +64,9 @@ func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
-	for _, alert := range msg.Alerts {
+	var blocks []slack.Block
+
+	for i, alert := range msg.Alerts {
 		var summary string
 		if alert.Status != "resolved" {
 			summary = ":sos: " + alert.Annotations["summary"]
@@ -116,21 +120,22 @@ func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
 			contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Ended at: %s", alert.EndsAt.Format(time.RFC822)), true, false))
 		}
 
-		blocks := []slack.Block{
-			slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)),
-			slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", "> "+alert.Annotations["description"], false, false), nil, nil),
+		if i != 0 {
+			blocks = append(blocks, slack.NewDividerBlock())
 		}
+
+		blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
+		blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", "> "+alert.Annotations["description"], false, false), nil, nil))
 		blocks = append(blocks, labelBlocks...)
 		blocks = append(blocks, slack.NewActionBlock("actions", buttons...))
 		blocks = append(blocks, slack.NewContextBlock("context", contextElements...))
-
-		return slack.WebhookMessage{
-			Username: "Grafana",
-			Channel:  "slamdev-test",
-			Blocks:   &slack.Blocks{BlockSet: blocks},
-		}
 	}
-	return slack.WebhookMessage{}
+
+	return slack.WebhookMessage{
+		Username: "Grafana",
+		Channel:  "slamdev-test",
+		Blocks:   &slack.Blocks{BlockSet: blocks},
+	}
 }
 
 func extractValue(valueString string) string {
@@ -145,7 +150,42 @@ func extractValue(valueString string) string {
 		log.Printf("cannot split value by ' ': %s", valueString)
 		return valueString
 	}
-	return value[0]
+	str, err := humanize(value[0])
+	if err != nil {
+		log.Printf("cannot humanize value: %s", value[0])
+		return value[0]
+	}
+	return str
+}
+
+func humanize(i string) (string, error) {
+	v, err := strconv.ParseFloat(i, 64)
+	if err != nil {
+		return "", err
+	}
+	if v == 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Sprintf("%.4g", v), nil
+	}
+	if math.Abs(v) >= 1 {
+		prefix := ""
+		for _, p := range []string{"k", "M", "G", "T", "P", "E", "Z", "Y"} {
+			if math.Abs(v) < 1000 {
+				break
+			}
+			prefix = p
+			v /= 1000
+		}
+		return fmt.Sprintf("%.4g%s", v, prefix), nil
+	}
+	prefix := ""
+	for _, p := range []string{"m", "u", "n", "p", "f", "a", "z", "y"} {
+		if math.Abs(v) >= 1 {
+			break
+		}
+		prefix = p
+		v *= 1000
+	}
+	return fmt.Sprintf("%.4g%s", v, prefix), nil
 }
 
 func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {

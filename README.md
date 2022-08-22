@@ -28,6 +28,12 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          readinessProbe: &health-check
+            httpGet:
+              port: http
+              path: /health
+          livenessProbe: *health-check
+          startupProbe: *health-check
 ---
 apiVersion: v1
 kind: Service
