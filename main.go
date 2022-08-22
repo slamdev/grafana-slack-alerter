@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -133,7 +134,12 @@ func buildMessage(msg GrafanaMsg, channel string) slack.WebhookMessage {
 
 		blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
 		if description, ok := alert.Annotations["description"]; ok && description != "" {
-			blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", "> "+description, false, false), nil, nil))
+			var formattedDescription string
+			scanner := bufio.NewScanner(strings.NewReader(description))
+			for scanner.Scan() {
+				formattedDescription = fmt.Sprintf("%s> %s \n", formattedDescription, scanner.Text())
+			}
+			blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", formattedDescription, false, false), nil, nil))
 		}
 		blocks = append(blocks, labelBlocks...)
 		blocks = append(blocks, slack.NewActionBlock("actions", buttons...))
