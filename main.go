@@ -18,9 +18,11 @@ import (
 )
 
 var webhookUrl string
+var username string
 
 func main() {
 	flag.StringVar(&webhookUrl, "webhook-url", "", "Slack webhook url")
+	flag.StringVar(&username, "username", "Grafana", "Slack username")
 	flag.Parse()
 
 	http.HandleFunc("/slack", handleWebhookRequest)
@@ -41,6 +43,11 @@ func main() {
 }
 
 func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
+	channel := r.URL.Query().Get("channel")
+	if channel == "" {
+		channel = "alerts"
+		log.Println("slack channel is not specified in 'channel' query param, using default 'alerts' channel")
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Println(err)
@@ -53,7 +60,7 @@ func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	slackMsg := buildMessage(grafanaMsg)
+	slackMsg := buildMessage(grafanaMsg, channel)
 
 	if err := slack.PostWebhookContext(r.Context(), webhookUrl, &slackMsg); err != nil {
 		log.Println(err)
@@ -63,7 +70,7 @@ func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
+func buildMessage(msg GrafanaMsg, channel string) slack.WebhookMessage {
 	var blocks []slack.Block
 
 	for i, alert := range msg.Alerts {
@@ -125,15 +132,17 @@ func buildMessage(msg GrafanaMsg) slack.WebhookMessage {
 		}
 
 		blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
-		blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", "> "+alert.Annotations["description"], false, false), nil, nil))
+		if description, ok := alert.Annotations["description"]; ok && description != "" {
+			blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", "> "+description, false, false), nil, nil))
+		}
 		blocks = append(blocks, labelBlocks...)
 		blocks = append(blocks, slack.NewActionBlock("actions", buttons...))
 		blocks = append(blocks, slack.NewContextBlock("context", contextElements...))
 	}
 
 	return slack.WebhookMessage{
-		Username: "Grafana",
-		Channel:  "slamdev-test",
+		Username: username,
+		Channel:  channel,
 		Blocks:   &slack.Blocks{BlockSet: blocks},
 	}
 }
