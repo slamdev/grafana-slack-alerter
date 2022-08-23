@@ -8,10 +8,12 @@ import (
 	"github.com/ory/graceful"
 	"github.com/slack-go/slack"
 	"golang.org/x/exp/maps"
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
 	"net/http"
+	"net/http/httputil"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,11 +38,28 @@ func main() {
 		Handler: http.DefaultServeMux,
 	})
 
+	http.DefaultTransport = LoggingRoundTripper{http.DefaultTransport}
+
 	log.Println("starting the server")
 	if err := graceful.Graceful(server.ListenAndServe, server.Shutdown); err != nil {
 		log.Fatalln("failed to gracefully shutdown")
 	}
 	log.Println("server stopped")
+}
+
+type LoggingRoundTripper struct {
+	Proxied http.RoundTripper
+}
+
+func (l LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	reqDump, _ := httputil.DumpRequest(req, true)
+	res, err := l.Proxied.RoundTrip(req)
+	if res.StatusCode != http.StatusOK {
+		resDump, _ := httputil.DumpResponse(res, true)
+		log.Println("err request", string(reqDump))
+		log.Println("err response", string(resDump))
+	}
+	return res, err
 }
 
 func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
@@ -61,96 +80,141 @@ func handleWebhookRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	slackMsg := buildMessage(grafanaMsg, channel)
 
-	if err := slack.PostWebhookContext(r.Context(), webhookUrl, &slackMsg); err != nil {
-		log.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	slackMsgs := buildMessages(grafanaMsg, channel)
+
+	var lastError error
+	for _, slackMsg := range slackMsgs {
+		if err := slack.PostWebhookContext(r.Context(), webhookUrl, &slackMsg); err != nil {
+			lastError = err
+			log.Println(err)
+		}
 	}
-	w.WriteHeader(http.StatusOK)
+	if lastError != nil {
+		http.Error(w, lastError.Error(), http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 }
 
-func buildMessage(msg GrafanaMsg, channel string) slack.WebhookMessage {
-	var blocks []slack.Block
+func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
+	var messages []slack.WebhookMessage
 
-	for i, alert := range msg.Alerts {
-		var summary string
-		if alert.Status != "resolved" {
-			summary = ":sos: " + alert.Annotations["summary"]
-		} else {
-			summary = ":large_green_circle: " + alert.Annotations["summary"]
-		}
+	alertsByStatus := groupByStatus(msg)
 
-		var buttons []slack.BlockElement
+	for _, groupedAlerts := range alertsByStatus {
 
-		generatorButton := slack.NewButtonBlockElement("generator", "", slack.NewTextBlockObject("plain_text", ":chart_with_upwards_trend: Details", true, false))
-		generatorButton.URL = alert.GeneratorURL
-		generatorButton.Style = slack.StylePrimary
-		buttons = append(buttons, generatorButton)
+		chunkedAlerts := chunkBy(groupedAlerts, 7)
 
-		if alert.Status != "resolved" {
-			if runbookUrl, ok := alert.Annotations["runbook_url"]; ok && runbookUrl != "" {
-				runbookButton := slack.NewButtonBlockElement("runbook", "", slack.NewTextBlockObject("plain_text", ":page_with_curl: Runbook", true, false))
-				runbookButton.URL = runbookUrl
-				runbookButton.Style = slack.StyleDefault
-				buttons = append(buttons, runbookButton)
+		for _, alerts := range chunkedAlerts {
+
+			var firedText string
+			var resolvedText string
+			var blocks []slack.Block
+
+			for i, alert := range alerts {
+				var summary string
+				if alert.Status != "resolved" {
+					summary = ":sos: " + alert.Annotations["summary"]
+					firedText = fmt.Sprintf("%s[%s] ", firedText, alert.Annotations["summary"])
+				} else {
+					summary = ":large_green_circle: " + alert.Annotations["summary"]
+					resolvedText = fmt.Sprintf("%s[%s] ", resolvedText, alert.Annotations["summary"])
+				}
+
+				var buttons []slack.BlockElement
+
+				generatorButton := slack.NewButtonBlockElement("generator", "", slack.NewTextBlockObject("plain_text", ":chart_with_upwards_trend: Details", true, false))
+				generatorButton.URL = alert.GeneratorURL
+				generatorButton.Style = slack.StylePrimary
+				buttons = append(buttons, generatorButton)
+
+				if alert.Status != "resolved" {
+					if runbookUrl, ok := alert.Annotations["runbook_url"]; ok && runbookUrl != "" {
+						runbookButton := slack.NewButtonBlockElement("runbook", "", slack.NewTextBlockObject("plain_text", ":page_with_curl: Runbook", true, false))
+						runbookButton.URL = runbookUrl
+						runbookButton.Style = slack.StyleDefault
+						buttons = append(buttons, runbookButton)
+					}
+				}
+
+				if alert.Status != "resolved" {
+					silenceButton := slack.NewButtonBlockElement("silence", "", slack.NewTextBlockObject("plain_text", ":no_bell: Silence", true, false))
+					silenceButton.URL = alert.SilenceURL
+					silenceButton.Style = slack.StyleDanger
+					buttons = append(buttons, silenceButton)
+				}
+
+				labelsNames := maps.Keys(alert.Labels)
+				sort.Strings(labelsNames)
+
+				var labelFields []*slack.TextBlockObject
+				for _, name := range labelsNames {
+					labelFields = append(labelFields, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s*:\n`%s`", name, alert.Labels[name]), false, false))
+				}
+				chunkedLabelFields := chunkBy(labelFields, 10)
+
+				var labelBlocks []slack.Block
+				for _, fields := range chunkedLabelFields {
+					labelBlocks = append(labelBlocks, slack.NewSectionBlock(nil, fields, nil))
+				}
+
+				var contextElements []slack.MixedElement
+				if alert.ValueString != "" {
+					contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false))
+				}
+				contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Started at: %s", alert.StartsAt.Format(time.RFC822)), true, false))
+				if !alert.EndsAt.IsZero() {
+					contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Ended at: %s", alert.EndsAt.Format(time.RFC822)), true, false))
+				}
+
+				if i != 0 {
+					blocks = append(blocks, slack.NewDividerBlock())
+				}
+
+				blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
+				if description, ok := alert.Annotations["description"]; ok && description != "" {
+					var formattedDescription string
+					scanner := bufio.NewScanner(strings.NewReader(description))
+					for scanner.Scan() {
+						formattedDescription = fmt.Sprintf("%s> %s \n", formattedDescription, scanner.Text())
+					}
+					blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", formattedDescription, false, false), nil, nil))
+				}
+				blocks = append(blocks, labelBlocks...)
+				blocks = append(blocks, slack.NewActionBlock(fmt.Sprintf("actions-%s", hash(alert.Labels)), buttons...))
+				blocks = append(blocks, slack.NewContextBlock(fmt.Sprintf("context-%s", hash(alert.Labels)), contextElements...))
 			}
-		}
 
-		if alert.Status != "resolved" {
-			silenceButton := slack.NewButtonBlockElement("silence", "", slack.NewTextBlockObject("plain_text", ":no_bell: Silence", true, false))
-			silenceButton.URL = alert.SilenceURL
-			silenceButton.Style = slack.StyleDanger
-			buttons = append(buttons, silenceButton)
-		}
-
-		labelsNames := maps.Keys(alert.Labels)
-		sort.Strings(labelsNames)
-
-		var labelFields []*slack.TextBlockObject
-		for _, name := range labelsNames {
-			labelFields = append(labelFields, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s*:\n`%s`", name, alert.Labels[name]), false, false))
-		}
-		chunkedLabelFields := chunkBy(labelFields, 10)
-
-		var labelBlocks []slack.Block
-		for _, fields := range chunkedLabelFields {
-			labelBlocks = append(labelBlocks, slack.NewSectionBlock(nil, fields, nil))
-		}
-
-		var contextElements []slack.MixedElement
-		if alert.ValueString != "" {
-			contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false))
-		}
-		contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Started at: %s", alert.StartsAt.Format(time.RFC822)), true, false))
-		if !alert.EndsAt.IsZero() {
-			contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Ended at: %s", alert.EndsAt.Format(time.RFC822)), true, false))
-		}
-
-		if i != 0 {
-			blocks = append(blocks, slack.NewDividerBlock())
-		}
-
-		blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
-		if description, ok := alert.Annotations["description"]; ok && description != "" {
-			var formattedDescription string
-			scanner := bufio.NewScanner(strings.NewReader(description))
-			for scanner.Scan() {
-				formattedDescription = fmt.Sprintf("%s> %s \n", formattedDescription, scanner.Text())
+			var previewText string
+			if firedText != "" {
+				previewText = fmt.Sprintf("Fired: %s", firedText)
+			} else if resolvedText != "" {
+				previewText = fmt.Sprintf("Resolved: %s", resolvedText)
 			}
-			blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", formattedDescription, false, false), nil, nil))
+
+			messages = append(messages, slack.WebhookMessage{
+				Username: username,
+				Channel:  channel,
+				Text:     previewText,
+				Blocks:   &slack.Blocks{BlockSet: blocks},
+			})
 		}
-		blocks = append(blocks, labelBlocks...)
-		blocks = append(blocks, slack.NewActionBlock("actions", buttons...))
-		blocks = append(blocks, slack.NewContextBlock("context", contextElements...))
 	}
 
-	return slack.WebhookMessage{
-		Username: username,
-		Channel:  channel,
-		Blocks:   &slack.Blocks{BlockSet: blocks},
+	return messages
+}
+
+func groupByStatus(msg GrafanaMsg) map[string][]Alert {
+	grouped := map[string][]Alert{}
+	for _, alert := range msg.Alerts {
+		if alerts, ok := grouped[alert.Status]; ok {
+			grouped[alert.Status] = append(alerts, alert)
+			continue
+		}
+		grouped[alert.Status] = []Alert{alert}
 	}
+	return grouped
 }
 
 func extractValue(valueString string) string {
@@ -208,6 +272,16 @@ func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {
 		items, chunks = items[chunkSize:], append(chunks, items[0:chunkSize:chunkSize])
 	}
 	return append(chunks, items)
+}
+
+func hash(items map[string]string) string {
+	var text string
+	for k, v := range items {
+		text = text + k + v
+	}
+	algorithm := fnv.New32a()
+	_, _ = algorithm.Write([]byte(text))
+	return strconv.FormatUint(uint64(algorithm.Sum32()), 10)
 }
 
 type GrafanaMsg struct {
