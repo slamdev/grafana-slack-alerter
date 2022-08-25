@@ -150,7 +150,11 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 
 				var labelFields []*slack.TextBlockObject
 				for _, name := range labelsNames {
-					labelFields = append(labelFields, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s*:\n`%s`", name, alert.Labels[name]), false, false))
+					value := alert.Labels[name]
+					if name == "label_app_kubernetes_io_team" {
+						value = "@" + value
+					}
+					labelFields = append(labelFields, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s*:\n`%s`", name, value), false, false))
 				}
 				chunkedLabelFields := chunkBy(labelFields, 10)
 
