@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,10 +23,14 @@ import (
 
 var webhookUrl string
 var username string
+var grafanaAlertSource bool
+var grafanaUrl string
 
 func main() {
 	flag.StringVar(&webhookUrl, "webhook-url", "", "Slack webhook url")
 	flag.StringVar(&username, "username", "Grafana", "Slack username")
+	flag.BoolVar(&grafanaAlertSource, "grafanaAlertSource", true, "Set to false to use alerter with external alert manager")
+	flag.StringVar(&grafanaUrl, "grafanaUrl", "", "URL to grafana (applicable only when grafanaAlertSource=false)")
 	flag.Parse()
 
 	http.HandleFunc("/slack", handleWebhookRequest)
@@ -124,10 +129,32 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 
 				var buttons []slack.BlockElement
 
-				generatorButton := slack.NewButtonBlockElement("generator", "", slack.NewTextBlockObject("plain_text", ":chart_with_upwards_trend: Details", true, false))
-				generatorButton.URL = alert.GeneratorURL
+				generatorButton := slack.NewButtonBlockElement("generator", "", slack.NewTextBlockObject("plain_text", ":information_source: Details", true, false))
+				if grafanaAlertSource {
+					generatorButton.URL = alert.GeneratorURL
+				} else {
+					var labels []string
+					for k, v := range alert.Labels {
+						labels = append(labels, fmt.Sprintf(`%s="%s"`, k, v))
+					}
+					query := fmt.Sprintf("{%s}", strings.Join(labels, ","))
+					generatorButton.URL = fmt.Sprintf("%s/alerting/list?queryString=%s&ruleType=alerting", grafanaUrl, url.QueryEscape(query))
+				}
 				generatorButton.Style = slack.StylePrimary
 				buttons = append(buttons, generatorButton)
+
+				if !grafanaAlertSource {
+					parsed, err := url.ParseRequestURI(strings.TrimSuffix(alert.GeneratorURL, `\u0026g0.tab=1`))
+					if err != nil {
+						log.Println(err)
+					} else {
+						exploreButton := slack.NewButtonBlockElement("explore", "", slack.NewTextBlockObject("plain_text", ":chart_with_upwards_trend: Explore", true, false))
+						expStr := fmt.Sprintf(`{"datasource":"prometheus","queries":[{"datasource":"Prometheus","expr":"%s","refId":"A"}],"range":{"from":"now-1h","to":"now"}}`, strings.ReplaceAll(parsed.Query().Get("g0.expr"), `"`, `\"`))
+						exploreButton.URL = fmt.Sprintf("%s/explore?left=%s", grafanaUrl, url.QueryEscape(expStr))
+						exploreButton.Style = slack.StylePrimary
+						buttons = append(buttons, exploreButton)
+					}
+				}
 
 				if alert.Status != "resolved" {
 					if runbookUrl, ok := alert.Annotations["runbook_url"]; ok && runbookUrl != "" {
@@ -140,7 +167,16 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 
 				if alert.Status != "resolved" {
 					silenceButton := slack.NewButtonBlockElement("silence", "", slack.NewTextBlockObject("plain_text", ":no_bell: Silence", true, false))
-					silenceButton.URL = alert.SilenceURL
+					if grafanaAlertSource {
+						silenceButton.URL = alert.SilenceURL
+					} else {
+						var matchers []string
+						for k, v := range alert.Labels {
+							matcher := fmt.Sprintf("%s=%s", k, v)
+							matchers = append(matchers, fmt.Sprintf(`matcher=%s`, url.QueryEscape(matcher)))
+						}
+						silenceButton.URL = fmt.Sprintf("%s/alerting/silence/new?alertmanager=Alertmanager&%s", grafanaUrl, strings.Join(matchers, "&"))
+					}
 					silenceButton.Style = slack.StyleDanger
 					buttons = append(buttons, silenceButton)
 				}
@@ -167,9 +203,9 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 				if alert.ValueString != "" {
 					contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false))
 				}
-				contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Started at: %s", alert.StartsAt.Format(time.RFC822)), true, false))
+				contextElements = append(contextElements, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("<!date^%d^Started at: {date_num} {time_secs}|_>", alert.StartsAt.Unix()), false, false))
 				if !alert.EndsAt.IsZero() {
-					contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Ended at: %s", alert.EndsAt.Format(time.RFC822)), true, false))
+					contextElements = append(contextElements, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("<!date^%d^Ended at: {date_num} {time_secs}|_>", alert.EndsAt.Unix()), false, false))
 				}
 
 				if i != 0 {
