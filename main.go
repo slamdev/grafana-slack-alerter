@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/ory/graceful"
 	"github.com/slack-go/slack"
-	"golang.org/x/exp/maps"
 	"hash/fnv"
 	"io"
 	"log"
@@ -15,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -181,24 +178,6 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 					buttons = append(buttons, silenceButton)
 				}
 
-				labelsNames := maps.Keys(alert.Labels)
-				sort.Strings(labelsNames)
-
-				var labelFields []*slack.TextBlockObject
-				for _, name := range labelsNames {
-					value := alert.Labels[name]
-					if name == "label_app_kubernetes_io_team" {
-						value = "@" + value
-					}
-					labelFields = append(labelFields, slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s*:\n`%s`", name, value), false, false))
-				}
-				chunkedLabelFields := chunkBy(labelFields, 10)
-
-				var labelBlocks []slack.Block
-				for _, fields := range chunkedLabelFields {
-					labelBlocks = append(labelBlocks, slack.NewSectionBlock(nil, fields, nil))
-				}
-
 				var contextElements []slack.MixedElement
 				if alert.ValueString != "" {
 					contextElements = append(contextElements, slack.NewTextBlockObject("plain_text", fmt.Sprintf("Value: %s", extractValue(alert.ValueString)), true, false))
@@ -213,15 +192,25 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 				}
 
 				blocks = append(blocks, slack.NewHeaderBlock(slack.NewTextBlockObject("plain_text", summary, true, false)))
+
 				if description, ok := alert.Annotations["description"]; ok && description != "" {
-					var formattedDescription string
-					scanner := bufio.NewScanner(strings.NewReader(description))
-					for scanner.Scan() {
-						formattedDescription = fmt.Sprintf("%s> %s \n", formattedDescription, scanner.Text())
-					}
-					blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", formattedDescription, false, false), nil, nil))
+					blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", description, false, false), nil, nil))
 				}
-				blocks = append(blocks, labelBlocks...)
+
+				for name, value := range alert.Labels {
+					if name == "label_app_kubernetes_io_team" {
+						alert.Labels[name] = "@" + value
+					}
+				}
+				labelsJson, err := json.Marshal(alert.Labels)
+				if err != nil {
+					log.Println(err)
+					labelsJson = []byte{}
+				}
+				labelsStr := string(labelsJson)
+				labelsStr = strings.ReplaceAll(strings.ReplaceAll(labelsStr, `":"`, `": "`), `","`, `", "`)
+				blocks = append(blocks, slack.NewSectionBlock(slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("```%s```", labelsStr), false, false), nil, nil))
+
 				blocks = append(blocks, slack.NewActionBlock(fmt.Sprintf("actions-%s", hash(alert.Labels)), buttons...))
 				blocks = append(blocks, slack.NewContextBlock(fmt.Sprintf("context-%s", hash(alert.Labels)), contextElements...))
 			}
