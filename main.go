@@ -22,12 +22,14 @@ var webhookUrl string
 var username string
 var grafanaAlertSource bool
 var grafanaUrl string
+var disableGrafanaSilenceButton bool
 
 func main() {
 	flag.StringVar(&webhookUrl, "webhook-url", "", "Slack webhook url")
 	flag.StringVar(&username, "username", "Grafana", "Slack username")
 	flag.BoolVar(&grafanaAlertSource, "grafanaAlertSource", true, "Set to false to use alerter with external alert manager")
 	flag.StringVar(&grafanaUrl, "grafanaUrl", "", "URL to grafana (applicable only when grafanaAlertSource=false)")
+	flag.BoolVar(&disableGrafanaSilenceButton, "grafanaSilenceButton", true, "Set to false to enable silence button in the alert message")
 	flag.Parse()
 
 	http.HandleFunc("/slack", handleWebhookRequest)
@@ -162,7 +164,7 @@ func buildMessages(msg GrafanaMsg, channel string) []slack.WebhookMessage {
 					}
 				}
 
-				if alert.Status != "resolved" {
+				if alert.Status != "resolved" && !disableGrafanaSilenceButton {
 					silenceButton := slack.NewButtonBlockElement("silence", "", slack.NewTextBlockObject("plain_text", ":no_bell: Silence", true, false))
 					if grafanaAlertSource {
 						silenceButton.URL = alert.SilenceURL
