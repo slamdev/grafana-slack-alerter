@@ -58,7 +58,9 @@ type LoggingRoundTripper struct {
 func (l LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	reqDump, _ := httputil.DumpRequest(req, true)
 	res, err := l.Proxied.RoundTrip(req)
-	if res.StatusCode != http.StatusOK {
+	if res == nil {
+		log.Println("nil res", err)
+	} else if res.StatusCode != http.StatusOK {
 		resDump, _ := httputil.DumpResponse(res, true)
 		log.Println("err request", string(reqDump))
 		log.Println("err response", string(resDump))
